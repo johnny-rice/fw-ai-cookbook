@@ -17,15 +17,20 @@ Run from cookbook/training with:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 import transformers
 
-import json
-from typing import Any
-
 from training.renderer.glm5 import GLM5Renderer
+from training.tests.glm5_serverless_cases import (
+    GLM5_SERVERLESS_PROMPT_TOKEN_CASES,
+    GLM5_SERVERLESS_STOP_TOKEN_IDS,
+)
+from training.utils.supervised import normalize_messages
+from tinker_cookbook.renderers import get_renderer
 from tinker_cookbook.renderers.base import ToolCall, TrainOnWhat
 
 
@@ -79,13 +84,22 @@ def tokenizer():
 
 @pytest.fixture(scope="module")
 def renderer(tokenizer):
+    """Strip-history renderer used for HF default ``clear_thinking`` parity."""
     return GLM5Renderer(tokenizer, strip_thinking_from_history=True)
 
 
 @pytest.fixture(scope="module")
 def renderer_keep_thinking(tokenizer):
-    """Renderer with ``strip_thinking_from_history=False``."""
-    return GLM5Renderer(tokenizer, strip_thinking_from_history=False)
+    """Registered-default preserve-thinking renderer."""
+    return GLM5Renderer(tokenizer)
+
+
+def test_registered_glm5_default_preserves_thinking(tokenizer):
+    default_renderer = get_renderer("glm5", tokenizer)
+
+    assert isinstance(default_renderer, GLM5Renderer)
+    assert default_renderer.strip_thinking_from_history is False
+    assert default_renderer.has_extension_property is True
 
 
 def _hf_tokens(tokenizer, messages, add_generation_prompt: bool, **kwargs) -> list[int]:
@@ -108,9 +122,13 @@ def _renderer_generation_tokens(renderer, messages) -> list[int]:
     return list(model_input.to_ints())
 
 
-def _renderer_supervised_tokens(renderer, messages) -> tuple[list[int], list[float]]:
+def _renderer_supervised_tokens(
+    renderer,
+    messages,
+    train_on_what: TrainOnWhat = TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+) -> tuple[list[int], list[float]]:
     model_input, weights = renderer.build_supervised_example(
-        messages, train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+        messages, train_on_what=train_on_what,
     )
     return list(model_input.to_ints()), weights.tolist()
 
@@ -577,6 +595,419 @@ def test_keep_thinking_generation_prompt(tokenizer, renderer_keep_thinking):
     assert ours == hf
 
 
+# ── Preserve-thinking / interleaved tool-call guardrails ────────────────────
+
+
+def _multi_turn_conversation_with_reasoning():
+    renderer_messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is 2+2?"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "HIST_THINK_A"},
+                {"type": "text", "text": "4"},
+            ],
+        },
+        {"role": "user", "content": "Now what is 3+3?"},
+    ]
+    hf_messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is 2+2?"},
+        {
+            "role": "assistant",
+            "reasoning_content": "HIST_THINK_A",
+            "content": "4",
+        },
+        {"role": "user", "content": "Now what is 3+3?"},
+    ]
+    return renderer_messages, hf_messages
+
+
+def test_strip_mode_strips_history_reasoning_in_generation(tokenizer, renderer):
+    renderer_messages, hf_messages = _multi_turn_conversation_with_reasoning()
+
+    ours = _renderer_generation_tokens(renderer, renderer_messages)
+    hf = _hf_tokens(tokenizer, hf_messages, add_generation_prompt=True)
+    decoded = tokenizer.decode(ours)
+
+    assert ours == hf
+    assert "HIST_THINK_A" not in decoded
+    # GLM's strip-history collapse marker is a bare closing tag.
+    assert "</think>4" in decoded
+
+
+def test_preserve_thinking_keeps_history_reasoning_in_generation(
+    tokenizer, renderer_keep_thinking
+):
+    renderer_messages, hf_messages = _multi_turn_conversation_with_reasoning()
+
+    ours = _renderer_generation_tokens(renderer_keep_thinking, renderer_messages)
+    hf = _hf_tokens(
+        tokenizer,
+        hf_messages,
+        add_generation_prompt=True,
+        clear_thinking=False,
+    )
+    decoded = tokenizer.decode(ours)
+
+    assert ours == hf
+    assert "<think>HIST_THINK_A</think>4" in decoded
+
+
+def test_preserve_thinking_supervised_matches_hf(tokenizer, renderer_keep_thinking):
+    renderer_messages, hf_messages = _multi_turn_conversation_with_reasoning()
+    renderer_messages = [
+        *renderer_messages,
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "CURRENT_THINK"},
+                {"type": "text", "text": "6"},
+            ],
+        },
+    ]
+    hf_messages = [
+        *hf_messages,
+        {
+            "role": "assistant",
+            "reasoning_content": "CURRENT_THINK",
+            "content": "6",
+        },
+    ]
+
+    hf = _hf_tokens(
+        tokenizer,
+        hf_messages,
+        add_generation_prompt=False,
+        clear_thinking=False,
+    )
+    ours, _ = _renderer_supervised_tokens(renderer_keep_thinking, renderer_messages)
+    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+
+
+def _interleaved_tool_raw_messages() -> list[dict[str, Any]]:
+    return [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "How are you today?"},
+        {
+            "role": "assistant",
+            "reasoning_content": "HIST_REASONING",
+            "content": "I'm doing well.",
+        },
+        {"role": "user", "content": "What's the weather in NYC?"},
+        {
+            "role": "assistant",
+            "reasoning_content": "CURRENT_REASONING",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": json.dumps(
+                            {"city": "New York, NY"}, ensure_ascii=False
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": json.dumps(
+                {"temperature": 72, "condition": "sunny"}, ensure_ascii=False
+            ),
+        },
+    ]
+
+
+def _hf_interleaved_tool_messages() -> list[dict[str, Any]]:
+    hf_messages = []
+    for message in _interleaved_tool_raw_messages():
+        hf_message = dict(message)
+        if hf_message.get("tool_calls"):
+            hf_message["tool_calls"] = [
+                {
+                    **tool_call,
+                    "function": {
+                        **tool_call["function"],
+                        "arguments": json.loads(tool_call["function"]["arguments"]),
+                    },
+                }
+                for tool_call in hf_message["tool_calls"]
+            ]
+        hf_messages.append(hf_message)
+    return hf_messages
+
+
+def test_strip_mode_preserves_current_interleaved_tool_reasoning(tokenizer, renderer):
+    """Strip-history GLM still preserves reasoning in the active user/tool suffix."""
+    renderer_messages = normalize_messages(_interleaved_tool_raw_messages())
+    hf_messages = _hf_interleaved_tool_messages()
+
+    ours = _renderer_generation_tokens(renderer, renderer_messages)
+    hf = _hf_tokens(tokenizer, hf_messages, add_generation_prompt=True)
+    decoded = tokenizer.decode(ours)
+
+    assert ours == hf
+    assert "HIST_REASONING" not in decoded
+    assert "<think>CURRENT_REASONING</think>" in decoded
+    assert "<tool_call>get_weather" in decoded
+
+
+def test_preserve_thinking_tool_call_generation_matches_hf(
+    tokenizer, renderer_keep_thinking
+):
+    renderer_messages = normalize_messages(_interleaved_tool_raw_messages())
+    hf_messages = _hf_interleaved_tool_messages()
+
+    ours = _renderer_generation_tokens(renderer_keep_thinking, renderer_messages)
+    hf = _hf_tokens(
+        tokenizer,
+        hf_messages,
+        add_generation_prompt=True,
+        clear_thinking=False,
+    )
+    decoded = tokenizer.decode(ours)
+
+    assert ours == hf
+    assert "<think>HIST_REASONING</think>I'm doing well." in decoded
+    assert "<think>CURRENT_REASONING</think>" in decoded
+    assert "<tool_call>get_weather" in decoded
+
+
+def test_interleaved_tool_reasoning_and_params_are_trained(tokenizer, renderer):
+    """GLM docs-shaped assistant tool call trains reasoning and call params."""
+    raw_messages = [
+        {"role": "user", "content": "weather in SF?"},
+        {
+            "role": "assistant",
+            "reasoning_content": "Need current weather.",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": json.dumps({"city": "SF"}, ensure_ascii=False),
+                    },
+                }
+            ],
+        },
+    ]
+    messages = normalize_messages(raw_messages)
+    tokens, weights = _renderer_supervised_tokens(renderer, messages)
+    trained_text = tokenizer.decode([t for t, w in zip(tokens, weights) if w > 0])
+
+    assert "<think>Need current weather.</think>" in trained_text
+    assert "<tool_call>get_weather" in trained_text
+    assert "<arg_value>SF</arg_value>" in trained_text
+
+
+# ── build_supervised_examples split behaviour ───────────────────────────────
+
+
+def test_build_supervised_examples_last_assistant_matches(tokenizer, renderer):
+    messages = [
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "The answer is 4."},
+        {"role": "user", "content": "And what is 3+3?"},
+        {"role": "assistant", "content": "The answer is 6."},
+    ]
+
+    single_input, single_weights = renderer.build_supervised_example(
+        messages,
+        train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
+    )
+    examples = renderer.build_supervised_examples(
+        messages,
+        train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
+    )
+
+    assert len(examples) == 1
+    list_input, list_weights = examples[0]
+    assert list_input.to_ints() == single_input.to_ints()
+    assert list_weights.tolist() == single_weights.tolist()
+
+
+def test_build_supervised_examples_all_assistant_splits_by_user_turn(
+    tokenizer, renderer
+):
+    messages = [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "Q2"},
+        {"role": "assistant", "content": "A2"},
+        {"role": "user", "content": "Q3"},
+        {"role": "assistant", "content": "A3"},
+    ]
+
+    examples = renderer.build_supervised_examples(
+        messages,
+        train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+    )
+
+    assert len(examples) == 3
+    decoded_examples = [tokenizer.decode(ex[0].to_ints()) for ex in examples]
+    trained_examples = [
+        tokenizer.decode([t for t, w in zip(ex[0].to_ints(), ex[1].tolist()) if w > 0])
+        for ex in examples
+    ]
+
+    assert "A1" in decoded_examples[0]
+    assert "A2" not in decoded_examples[0]
+    assert "A3" not in decoded_examples[0]
+
+    assert "A1" in decoded_examples[1]
+    assert "A2" in decoded_examples[1]
+    assert "A3" not in decoded_examples[1]
+
+    assert "A1" in decoded_examples[2]
+    assert "A2" in decoded_examples[2]
+    assert "A3" in decoded_examples[2]
+
+    assert "A1" in trained_examples[0]
+    assert "A2" in trained_examples[1]
+    assert "A1" not in trained_examples[1]
+    assert "A3" in trained_examples[2]
+    assert "A1" not in trained_examples[2]
+    assert "A2" not in trained_examples[2]
+
+
+def test_build_supervised_examples_warns_on_non_assistant_mode(tokenizer, renderer):
+    messages = [
+        {"role": "user", "content": "What is 2+2?"},
+        {"role": "assistant", "content": "The answer is 4."},
+        {"role": "user", "content": "And what is 3+3?"},
+        {"role": "assistant", "content": "The answer is 6."},
+    ]
+
+    with pytest.warns(UserWarning, match="does not satisfy the extension property"):
+        examples = renderer.build_supervised_examples(
+            messages,
+            train_on_what=TrainOnWhat.ALL_MESSAGES,
+        )
+
+    assert len(examples) == 2
+    decoded = [tokenizer.decode(ex[0].to_ints()) for ex in examples]
+    assert "2+2" in decoded[0]
+    assert "4" in decoded[0]
+    assert "3+3" not in decoded[0]
+    assert "6" not in decoded[0]
+    assert "2+2" in decoded[1]
+    assert "4" in decoded[1]
+    assert "3+3" in decoded[1]
+    assert "6" in decoded[1]
+
+
+def test_build_supervised_examples_all_assistant_with_tool_calls(
+    tokenizer, renderer
+):
+    messages = [
+        {"role": "user", "content": "Q"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "think A"},
+                {"type": "text", "text": ""},
+            ],
+            "tool_calls": [_make_tool_call("get_weather", {"location": "NYC"})],
+        },
+        {"role": "tool", "content": '{"temperature": 72}'},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "think B"},
+                {"type": "text", "text": "A"},
+            ],
+        },
+        {"role": "user", "content": "Q2"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "think C"},
+                {"type": "text", "text": ""},
+            ],
+            "tool_calls": [_make_tool_call("get_weather", {"location": "LA"})],
+        },
+        {"role": "tool", "content": '{"temperature": 85}'},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "think D"},
+                {"type": "text", "text": "A2"},
+            ],
+        },
+    ]
+
+    examples = renderer.build_supervised_examples(
+        messages,
+        train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+    )
+
+    assert len(examples) == 2
+    example0_input, example0_weights = examples[0]
+    example1_input, example1_weights = examples[1]
+
+    expected_input, expected_weights = renderer.build_supervised_example(
+        messages[:4],
+        train_on_what=TrainOnWhat.LAST_ASSISTANT_TURN,
+    )
+    _, all_assist_weights = renderer.build_supervised_example(
+        messages[:4],
+        train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+    )
+
+    assert example0_input.to_ints() == expected_input.to_ints()
+    assert example0_weights.tolist() == expected_weights.tolist()
+    assert example0_weights.tolist() == all_assist_weights.tolist()
+
+    expected_input, expected_weights = renderer.build_supervised_example(
+        messages,
+        train_on_what=TrainOnWhat.LAST_ASSISTANT_TURN,
+    )
+    _, all_assist_weights = renderer.build_supervised_example(
+        messages,
+        train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+    )
+
+    assert example1_input.to_ints() == expected_input.to_ints()
+    assert example1_weights.tolist() == expected_weights.tolist()
+    assert example1_weights.tolist() != all_assist_weights.tolist()
+
+
+def test_preserve_thinking_build_supervised_examples_keeps_single_example(
+    tokenizer, renderer_keep_thinking
+):
+    messages, _ = _multi_turn_conversation_with_reasoning()
+    messages = [
+        *messages,
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "CURRENT_THINK"},
+                {"type": "text", "text": "6"},
+            ],
+        },
+    ]
+
+    single_input, single_weights = renderer_keep_thinking.build_supervised_example(
+        messages,
+        train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+    )
+    examples = renderer_keep_thinking.build_supervised_examples(
+        messages,
+        train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+    )
+
+    assert len(examples) == 1
+    assert examples[0][0].to_ints() == single_input.to_ints()
+    assert examples[0][1].tolist() == single_weights.tolist()
+
+
 # ── Weight mask correctness (independent of HF parity) ──────────────────────
 
 
@@ -669,9 +1100,25 @@ def test_bos_tokens_are_gMASK_sop(tokenizer, renderer):
     assert len(bos) == 2  # [gMASK]=154822, <sop>=154824 on GLM-5.1
 
 
-def test_stop_sequences_returns_eos(tokenizer, renderer):
+def test_stop_sequences_returns_eos_and_next_role_tags(tokenizer, renderer):
     stops = renderer.get_stop_sequences()
-    assert stops == [_eos(tokenizer)]
+    expected = [
+        GLM5_SERVERLESS_STOP_TOKEN_IDS["eos"],
+        GLM5_SERVERLESS_STOP_TOKEN_IDS["user"],
+        GLM5_SERVERLESS_STOP_TOKEN_IDS["observation"],
+    ]
+    assert stops == expected
+    assert _eos(tokenizer) == GLM5_SERVERLESS_STOP_TOKEN_IDS["eos"]
+    assert all(
+        len(tokenizer.encode(tag, add_special_tokens=False)) == 1
+        for tag in ("<|user|>", "<|observation|>")
+    )
+    assert tokenizer.encode("<|user|>", add_special_tokens=False)[0] == (
+        GLM5_SERVERLESS_STOP_TOKEN_IDS["user"]
+    )
+    assert tokenizer.encode("<|observation|>", add_special_tokens=False)[0] == (
+        GLM5_SERVERLESS_STOP_TOKEN_IDS["observation"]
+    )
 
 
 def test_generation_suffix_is_role_tag(tokenizer, renderer):
@@ -710,8 +1157,43 @@ def test_parse_response_roundtrip(tokenizer, renderer):
         assert "hello" in content
 
 
+def test_parse_response_stops_at_user_role(tokenizer, renderer):
+    simulated = "<think></think>first answer<|user|>next question"
+    ids = tokenizer.encode(simulated, add_special_tokens=False)
+    message, ok = renderer.parse_response(ids)
+
+    assert ok is True
+    content = message["content"]
+    text = content if isinstance(content, str) else "".join(
+        p.get("text", "") for p in content if p.get("type") == "text"
+    )
+    assert "first answer" in text
+    assert "next question" not in text
+
+
+def test_parse_response_stops_at_observation_role_and_extracts_tool_call(
+    tokenizer, renderer
+):
+    simulated = (
+        "<think>need weather</think>"
+        "<tool_call>get_weather"
+        "<arg_key>city</arg_key><arg_value>SF</arg_value>"
+        "</tool_call>"
+        "<|observation|><tool_response>sunny</tool_response>"
+    )
+    ids = tokenizer.encode(simulated, add_special_tokens=False)
+    message, ok = renderer.parse_response(ids)
+
+    assert ok is True
+    assert message["tool_calls"][0].function.name == "get_weather"
+    assert json.loads(message["tool_calls"][0].function.arguments) == {"city": "SF"}
+    content = message["content"]
+    assert isinstance(content, list)
+    assert content == [{"type": "thinking", "thinking": "need weather"}]
+
+
 def test_parse_response_no_stop_token(tokenizer, renderer):
-    """parse_response should return ok=False if no EOS is present."""
+    """parse_response should return ok=False if no stop marker is present."""
     simulated = "\n<think></think>\nno stop here"
     ids = tokenizer.encode(simulated, add_special_tokens=False)
     _, ok = renderer.parse_response(ids)
@@ -787,6 +1269,82 @@ def test_generation_prompt_parity(tokenizer, renderer, messages):
         f"  HF text:   {tokenizer.decode(hf)!r}\n"
         f"  ours text: {tokenizer.decode(ours)!r}"
     )
+
+
+@pytest.mark.parametrize(
+    "case",
+    GLM5_SERVERLESS_PROMPT_TOKEN_CASES,
+    ids=[case["name"] for case in GLM5_SERVERLESS_PROMPT_TOKEN_CASES],
+)
+def test_generation_prompt_matches_recorded_fireworks_serverless_prompt_ids(
+    tokenizer,
+    renderer_keep_thinking,
+    case,
+):
+    """Recorded serverless IDs keep prompt parity covered without Fireworks."""
+    messages = normalize_messages(case["messages"])
+    ours = _renderer_generation_tokens(renderer_keep_thinking, messages)
+    expected = [int(token_id) for token_id in case["prompt_token_ids"]]
+
+    assert ours == expected, (
+        f"{case['name']} token mismatch against recorded Fireworks serverless "
+        "prompt_token_ids:\n"
+        f"  expected: {expected}\n"
+        f"  ours:     {ours}\n"
+        f"  expected text: {tokenizer.decode(expected)!r}\n"
+        f"  ours text:     {tokenizer.decode(ours)!r}"
+    )
+
+
+def test_recorded_fireworks_prompt_cases_cover_glm_role_and_tool_tokens(tokenizer):
+    token_ids_by_case = {
+        case["name"]: [int(token_id) for token_id in case["prompt_token_ids"]]
+        for case in GLM5_SERVERLESS_PROMPT_TOKEN_CASES
+    }
+    token_by_text = {}
+    for text in (
+        "<|system|>",
+        "<|user|>",
+        "<|assistant|>",
+        "<|observation|>",
+        "<think>",
+        "</think>",
+        "<tool_call>",
+        "</tool_call>",
+        "<tool_response>",
+        "</tool_response>",
+    ):
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+        assert len(encoded) == 1, f"{text!r} should be a single GLM special token"
+        token_by_text[text] = encoded[0]
+
+    assert token_by_text["<|system|>"] in token_ids_by_case[
+        "multi_tool_calls_nested_args_with_observations"
+    ]
+    assert token_by_text["<|user|>"] in token_ids_by_case[
+        "long_interleaved_preserved_reasoning"
+    ]
+    assert token_by_text["<|assistant|>"] in token_ids_by_case[
+        "long_interleaved_preserved_reasoning"
+    ]
+    assert token_by_text["<|observation|>"] in token_ids_by_case[
+        "multi_tool_calls_nested_args_with_observations"
+    ]
+    for tool_token in (
+        "<tool_call>",
+        "</tool_call>",
+        "<tool_response>",
+        "</tool_response>",
+    ):
+        assert token_by_text[tool_token] in token_ids_by_case[
+            "multi_tool_calls_nested_args_with_observations"
+        ]
+    assert token_ids_by_case["long_interleaved_preserved_reasoning"].count(
+        token_by_text["<think>"]
+    ) >= 4
+    assert token_ids_by_case["long_interleaved_preserved_reasoning"].count(
+        token_by_text["</think>"]
+    ) >= 3
 
 
 # ── Parametrized parity: supervised shapes ──────────────────────────────────

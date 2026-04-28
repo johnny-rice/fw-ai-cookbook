@@ -4,9 +4,12 @@ Handles the GLM-5.1 chat format as shipped with ``zai-org/GLM-5.1``
 (and its FP8 variant ``zai-org/GLM-5.1-FP8``, which ships an identical
 tokenizer and chat template).
 
-Token-level layout matches ``tokenizer.apply_chat_template`` byte-for-byte
+Token-level layout follows ``tokenizer.apply_chat_template`` byte-for-byte
 (verified by the unit tests in ``test_glm5_renderer.py``), modulo the
-intentional training EOS on the terminal assistant message.
+intentional training EOS on the terminal assistant message. The registered
+renderer uses GLM preserved-thinking semantics by default; opt-in
+``strip_thinking_from_history=True`` matches the template's standard
+``clear_thinking`` behavior.
 
 Role tag layout (as the shipped Jinja template emits them):
 
@@ -32,13 +35,17 @@ Assistant turn layout:
       <|assistant|></think>{content}
 
 - **Historical assistant turn** (any turn before the last user message) when
-  ``strip_thinking_from_history=True`` (the default)::
+  ``strip_thinking_from_history=False`` (the default) and reasoning content is
+  provided::
+
+      <|assistant|><think>{reasoning}</think>{content}
+
+- **Historical assistant turn** when ``strip_thinking_from_history=True``::
 
       <|assistant|></think>{content}
 
-  Historical turns drop any reasoning content to avoid leaking intermediate
-  reasoning into later turns' context. Matches the shipped template's
-  ``loop.index0 > ns.last_user_index`` branch.
+  This opt-in strip-history mode matches the shipped template's default
+  ``clear_thinking`` behavior.
 
 Other invariants:
 
@@ -69,6 +76,8 @@ Multimodal content is left for a future extension.
 from __future__ import annotations
 
 import json
+import re
+import warnings
 from collections.abc import Mapping
 from typing import Any
 
@@ -81,12 +90,20 @@ from tinker_cookbook.renderers.base import (
     Renderer,
     Role,
     ToolCall,
-    parse_response_for_stop_token,
+    TrainOnWhat,
+    UnparsedToolCall,
     parse_think_blocks,
 )
 from tinker_cookbook.tokenizer_utils import Tokenizer
 
 _BOS_TEXT = "[gMASK]<sop>"
+_USER_TEXT = "<|user|>"
+_OBSERVATION_TEXT = "<|observation|>"
+_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+_TOOL_ARG_RE = re.compile(
+    r"<arg_key>(.*?)</arg_key><arg_value>(.*?)</arg_value>",
+    re.DOTALL,
+)
 
 
 def _visible_text(content: Any) -> str:
@@ -132,6 +149,66 @@ def _format_tool_calls(tool_calls: list[ToolCall]) -> str:
     return "".join(parts)
 
 
+def _parse_arg_value(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def _parse_tool_call(
+    raw_body: str,
+    raw_text: str,
+) -> tuple[ToolCall | None, UnparsedToolCall | None]:
+    first_arg = raw_body.find("<arg_key>")
+    name = raw_body[:first_arg].strip() if first_arg >= 0 else raw_body.strip()
+    if not name:
+        return None, UnparsedToolCall(raw_text=raw_text, error="No tool name found")
+
+    arguments = {
+        match.group(1): _parse_arg_value(match.group(2))
+        for match in _TOOL_ARG_RE.finditer(raw_body)
+    }
+    cleaned_body = _TOOL_ARG_RE.sub("", raw_body).strip()
+    trailing = cleaned_body.removeprefix(name).strip()
+    unparsed = (
+        UnparsedToolCall(
+            raw_text=raw_text,
+            error=f"Unexpected content inside <tool_call>: {trailing!r}",
+        )
+        if trailing
+        else None
+    )
+    return (
+        ToolCall(
+            function=ToolCall.FunctionBody(
+                name=name,
+                arguments=json.dumps(arguments, ensure_ascii=False),
+            )
+        ),
+        unparsed,
+    )
+
+
+def _extract_tool_calls_from_content(
+    content: str,
+) -> tuple[str, list[ToolCall], list[UnparsedToolCall]]:
+    cleaned_parts: list[str] = []
+    tool_calls: list[ToolCall] = []
+    unparsed_tool_calls: list[UnparsedToolCall] = []
+    pos = 0
+    for match in _TOOL_CALL_RE.finditer(content):
+        cleaned_parts.append(content[pos : match.start()])
+        tool_call, unparsed = _parse_tool_call(match.group(1), match.group(0))
+        if tool_call is not None:
+            tool_calls.append(tool_call)
+        if unparsed is not None:
+            unparsed_tool_calls.append(unparsed)
+        pos = match.end()
+    cleaned_parts.append(content[pos:])
+    return "".join(cleaned_parts), tool_calls, unparsed_tool_calls
+
+
 def _extract_reasoning_and_text(content: Any) -> tuple[str, str]:
     """Return ``(reasoning, visible_text)`` for an assistant message."""
     if isinstance(content, str):
@@ -160,7 +237,7 @@ class GLM5Renderer(Renderer):
     def __init__(
         self,
         tokenizer: Tokenizer,
-        strip_thinking_from_history: bool = True,
+        strip_thinking_from_history: bool = False,
     ) -> None:
         super().__init__(tokenizer)
         self.strip_thinking_from_history = strip_thinking_from_history
@@ -183,8 +260,90 @@ class GLM5Renderer(Renderer):
             )
         return int(eos)
 
+    def _encode_single_special(self, token_str: str) -> int:
+        token_ids = self.tokenizer.encode(token_str, add_special_tokens=False)
+        if len(token_ids) != 1:
+            raise RuntimeError(
+                f"GLM5Renderer expected {token_str!r} to encode as one token, "
+                f"got {token_ids}."
+            )
+        return int(token_ids[0])
+
+    @property
+    def _user_token(self) -> int:
+        return self._encode_single_special(_USER_TEXT)
+
+    @property
+    def _observation_token(self) -> int:
+        return self._encode_single_special(_OBSERVATION_TEXT)
+
     def get_stop_sequences(self) -> list[int]:
-        return [self._end_message_token]
+        return [self._end_message_token, self._user_token, self._observation_token]
+
+    def build_supervised_examples(
+        self,
+        messages: list[Message],
+        train_on_what: TrainOnWhat = TrainOnWhat.LAST_ASSISTANT_TURN,
+    ):
+        """Build extension-safe supervised examples for multi-turn GLM data.
+
+        The registered GLM renderer preserves historical thinking by default,
+        so it can train all assistant messages in one datum. If callers opt
+        into strip-history mode, split by user turns and train each assistant
+        suffix in the same position it would occupy during generation.
+        """
+        if self.has_extension_property:
+            return [
+                self.build_supervised_example(
+                    messages,
+                    train_on_what=train_on_what,
+                )
+            ]
+
+        if train_on_what in (
+            TrainOnWhat.LAST_ASSISTANT_MESSAGE,
+            TrainOnWhat.LAST_ASSISTANT_TURN,
+        ):
+            return [
+                self.build_supervised_example(
+                    messages,
+                    train_on_what=train_on_what,
+                )
+            ]
+
+        user_message_idxs = [
+            idx for idx, message in enumerate(messages) if message["role"] == "user"
+        ]
+
+        if train_on_what != TrainOnWhat.ALL_ASSISTANT_MESSAGES:
+            warnings.warn(
+                "WARNING: Using train_on_what=ALL_MESSAGES/ALL_TOKENS/"
+                "ALL_USER_AND_SYSTEM_MESSAGES/CUSTOMIZED with a renderer that "
+                "does not satisfy the extension property "
+                "(has_extension_property=False). The same train_on_what mode is "
+                "applied to each user-turn prefix.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        supervised_examples = []
+        for user_message_idx in [*user_message_idxs[1:], len(messages)]:
+            current_messages = messages[:user_message_idx]
+            if train_on_what == TrainOnWhat.ALL_ASSISTANT_MESSAGES:
+                supervised_examples.append(
+                    self.build_supervised_example(
+                        current_messages,
+                        train_on_what=TrainOnWhat.LAST_ASSISTANT_TURN,
+                    )
+                )
+            else:
+                supervised_examples.append(
+                    self.build_supervised_example(
+                        current_messages,
+                        train_on_what=train_on_what,
+                    )
+                )
+        return supervised_examples
 
     def render_message(self, message: Message, ctx: RenderContext) -> RenderedMessage:
         role = message["role"]
@@ -235,7 +394,7 @@ class GLM5Renderer(Renderer):
 
         # Match the shipped HF chat template thinking-block logic:
         #
-        # 1. Historical turn with strip_thinking=True (the default):
+        # 1. Historical turn with strip_thinking=True:
         #    always ``</think>`` (drops any reasoning).
         # 2. Historical turn with strip_thinking=False AND reasoning
         #    exists: ``<think>{reasoning}</think>`` (keep it).
@@ -291,17 +450,31 @@ class GLM5Renderer(Renderer):
         return self.tokenizer.encode(suffix_str, add_special_tokens=False)
 
     def parse_response(self, response: list[int]) -> tuple[Message, bool]:
-        assistant_message, ok = parse_response_for_stop_token(
-            response=response,
-            tokenizer=self.tokenizer,
-            stop_token=self._end_message_token,
+        end_idx = len(response)
+        for stop_token in self.get_stop_sequences():
+            try:
+                idx = response.index(stop_token)
+            except ValueError:
+                continue
+            end_idx = min(end_idx, idx)
+        ok = end_idx < len(response)
+        assistant_message = Message(
+            role="assistant",
+            content=str(self.tokenizer.decode(response[:end_idx])),
         )
         if not ok:
             return assistant_message, False
         assert isinstance(assistant_message["content"], str)
         content = assistant_message["content"].lstrip("\n")
+        content, tool_calls, unparsed_tool_calls = _extract_tool_calls_from_content(
+            content
+        )
         parts = parse_think_blocks(content)
         assistant_message["content"] = parts if parts is not None else content
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
+        if unparsed_tool_calls:
+            assistant_message["unparsed_tool_calls"] = unparsed_tool_calls
         return assistant_message, True
 
 
