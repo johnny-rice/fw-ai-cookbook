@@ -3,9 +3,9 @@
 Loads the public ``zai-org/GLM-5.1`` tokenizer (which ships the canonical
 chat template for GLM-5.1) and checks that every supported renderer
 output matches what ``tokenizer.apply_chat_template`` produces
-byte-for-byte, modulo the intentional training EOS on the terminal
-assistant message. Falls back to a local tokenizer path when the
-HuggingFace Hub isn't reachable (e.g. internal CI).
+byte-for-byte, modulo the terminal role stop token appended to supervised
+examples that end on an assistant message. Falls back to a local tokenizer
+path when the HuggingFace Hub isn't reachable (e.g. internal CI).
 
 The ``zai-org/GLM-5.1-FP8`` repo ships an identical tokenizer + chat
 template (verified: byte-for-byte equal). We use the bf16 repo here
@@ -137,33 +137,68 @@ def _eos(tokenizer) -> int:
     return int(tokenizer.eos_token_id)
 
 
-def _assert_parity_modulo_trailing_eos(
-    ours: list[int], hf: list[int], tokenizer, *, expect_eos: bool,
-) -> None:
-    """Compare token sequences, accounting for the intentional trailing EOS.
+def _encode_single(tokenizer, text: str) -> int:
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    assert len(token_ids) == 1, f"{text!r} encoded to {token_ids}"
+    return int(token_ids[0])
 
-    GLM5Renderer appends ``<|endoftext|>`` only to the final message in a
-    conversation, so the trained model learns when to stop. The upstream
-    Jinja template does not emit EOS anywhere. When *expect_eos* is True,
-    strip exactly one trailing EOS from our output before the equality
-    check; historical assistant turns inside the sequence must already
-    match the Jinja byte-for-byte without any EOS adjustment.
+
+def _user_token(tokenizer) -> int:
+    return _encode_single(tokenizer, "<|user|>")
+
+
+def _observation_token(tokenizer) -> int:
+    return _encode_single(tokenizer, "<|observation|>")
+
+
+def _assistant_stop_token(tokenizer, message: dict[str, Any]) -> int:
+    return (
+        _observation_token(tokenizer)
+        if message.get("tool_calls")
+        else _user_token(tokenizer)
+    )
+
+
+def _find_subsequence(
+    tokens: list[int], subsequence: list[int], *, start: int = 0
+) -> int:
+    for i in range(start, len(tokens) - len(subsequence) + 1):
+        if tokens[i : i + len(subsequence)] == subsequence:
+            return i
+    raise AssertionError(f"Subsequence not found: {subsequence}")
+
+
+def _assert_supervised_parity_with_role_stop(
+    ours: list[int],
+    hf: list[int],
+    tokenizer,
+    messages: list[dict[str, Any]],
+) -> None:
+    """Compare supervised tokens against HF, accounting for terminal stop overlap.
+
+    GLM-5.1 does not use ``<|endoftext|>`` as the chat stop token. Assistant
+    turns stop on the next role tag: ``<|user|>`` for normal answers and
+    ``<|observation|>`` for tool-call handoff. The HF template only emits that
+    tag when the following message exists, so a supervised example that ends on
+    an assistant appends the role tag as stop overlap.
     """
     our_cmp = list(ours)
-    if expect_eos:
-        assert our_cmp and our_cmp[-1] == _eos(tokenizer), (
-            f"expected trailing <|endoftext|> ({_eos(tokenizer)}), got {our_cmp[-1:]}"
+    if messages and messages[-1]["role"] == "assistant":
+        expected_stop = _assistant_stop_token(tokenizer, messages[-1])
+        assert our_cmp and our_cmp[-1] == expected_stop, (
+            "expected trailing assistant stop token "
+            f"({expected_stop}), got {our_cmp[-1:]}"
         )
         our_cmp = our_cmp[:-1]
     assert our_cmp == hf, (
-        f"Token mismatch (EOS stripped={expect_eos}):\n"
+        "Token mismatch (terminal role stop stripped if present):\n"
         f"  HF:   {hf}\n  ours: {our_cmp}\n"
         f"  HF text:   {tokenizer.decode(hf)!r}\n"
         f"  ours text: {tokenizer.decode(our_cmp)!r}"
     )
 
 
-# ── Single-turn generation prompts (no trailing EOS — compare as-is) ────────
+# ── Single-turn generation prompts (compare as-is) ─────────────────────────
 
 
 def test_generation_prompt_user_only(tokenizer, renderer):
@@ -216,7 +251,7 @@ def test_generation_prompt_after_tool(tokenizer, renderer):
     assert ours == hf
 
 
-# ── Supervised examples (trailing EOS expected on our side) ─────────────────
+# ── Supervised examples (terminal assistant uses role-stop overlap) ─────────
 
 
 def test_supervised_single_turn_no_thinking(tokenizer, renderer):
@@ -227,7 +262,7 @@ def test_supervised_single_turn_no_thinking(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_supervised_single_turn_with_thinking(tokenizer, renderer):
@@ -238,7 +273,7 @@ def test_supervised_single_turn_with_thinking(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_supervised_system_user_assistant(tokenizer, renderer):
@@ -250,7 +285,7 @@ def test_supervised_system_user_assistant(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_supervised_memorization_pair(tokenizer, renderer):
@@ -267,7 +302,7 @@ def test_supervised_memorization_pair(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_supervised_unicode_content(tokenizer, renderer):
@@ -278,7 +313,7 @@ def test_supervised_unicode_content(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_supervised_long_content(tokenizer, renderer):
@@ -291,7 +326,7 @@ def test_supervised_long_content(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_supervised_empty_assistant_content(tokenizer, renderer):
@@ -302,7 +337,7 @@ def test_supervised_empty_assistant_content(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_supervised_whitespace_only_assistant_content(tokenizer, renderer):
@@ -313,7 +348,7 @@ def test_supervised_whitespace_only_assistant_content(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 # ── History thinking collapse ───────────────────────────────────────────────
@@ -340,7 +375,7 @@ def test_history_thinking_collapses_to_empty(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_two_assistants_after_last_user_both_keep_thinking(tokenizer, renderer):
@@ -357,7 +392,7 @@ def test_two_assistants_after_last_user_both_keep_thinking(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_history_no_thinking_in_source(tokenizer, renderer):
@@ -370,7 +405,7 @@ def test_history_no_thinking_in_source(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_history_first_has_thinking_second_does_not(tokenizer, renderer):
@@ -384,7 +419,7 @@ def test_history_first_has_thinking_second_does_not(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_history_first_no_thinking_second_has_thinking(tokenizer, renderer):
@@ -397,7 +432,7 @@ def test_history_first_no_thinking_second_has_thinking(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_history_three_turn_middle_has_thinking(tokenizer, renderer):
@@ -413,7 +448,7 @@ def test_history_three_turn_middle_has_thinking(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 # ── Tool / observation rendering ────────────────────────────────────────────
@@ -482,7 +517,7 @@ def test_supervised_tool_user_assistant(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 # ── Structured content (list of {"type": "text", ...}) ─────────────────────
@@ -496,7 +531,7 @@ def test_structured_text_content_user(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_structured_text_content_multi_parts(tokenizer, renderer):
@@ -510,7 +545,7 @@ def test_structured_text_content_multi_parts(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 # ── System message variations ───────────────────────────────────────────────
@@ -527,7 +562,7 @@ def test_multiple_system_messages(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_system_mid_conversation(tokenizer, renderer):
@@ -541,7 +576,7 @@ def test_system_mid_conversation(tokenizer, renderer):
     ]
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 # ── strip_thinking_from_history=False (clear_thinking=False) ────────────────
@@ -563,7 +598,7 @@ def test_keep_thinking_in_history(tokenizer, renderer_keep_thinking):
         tokenizer, messages, add_generation_prompt=False, clear_thinking=False,
     )
     ours, _ = _renderer_supervised_tokens(renderer_keep_thinking, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_keep_thinking_history_no_thinking_source(tokenizer, renderer_keep_thinking):
@@ -578,7 +613,7 @@ def test_keep_thinking_history_no_thinking_source(tokenizer, renderer_keep_think
         tokenizer, messages, add_generation_prompt=False, clear_thinking=False,
     )
     ours, _ = _renderer_supervised_tokens(renderer_keep_thinking, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 def test_keep_thinking_generation_prompt(tokenizer, renderer_keep_thinking):
@@ -683,7 +718,9 @@ def test_preserve_thinking_supervised_matches_hf(tokenizer, renderer_keep_thinki
         clear_thinking=False,
     )
     ours, _ = _renderer_supervised_tokens(renderer_keep_thinking, renderer_messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(
+        ours, hf, tokenizer, renderer_messages
+    )
 
 
 def _interleaved_tool_raw_messages() -> list[dict[str, Any]]:
@@ -802,7 +839,8 @@ def test_interleaved_tool_reasoning_and_params_are_trained(tokenizer, renderer):
     tokens, weights = _renderer_supervised_tokens(renderer, messages)
     trained_text = tokenizer.decode([t for t, w in zip(tokens, weights) if w > 0])
 
-    assert "<think>Need current weather.</think>" in trained_text
+    assert "<think>" not in trained_text
+    assert "Need current weather.</think>" in trained_text
     assert "<tool_call>get_weather" in trained_text
     assert "<arg_value>SF</arg_value>" in trained_text
 
@@ -1014,10 +1052,10 @@ def test_preserve_thinking_build_supervised_examples_keeps_single_example(
 def test_weight_mask_only_covers_assistant_output(tokenizer, renderer):
     """Every non-zero-weight position must decode to an assistant-output token.
 
-    Specifically: the trained span for the last assistant turn should be
-    ``<think></think>{content}<|endoftext|>`` — matching the shipped
-    Jinja template layout (no leading newline, no newline between the
-    think block and the content) plus the intentional trailing EOS.
+    Specifically: the rendered assistant turn contains
+    ``<think></think>{content}<|user|>``, but ``<think>`` is masked because
+    GLM-5.1 injects it in the generation prefix. The model trains from
+    ``</think>`` through the normal ``<|user|>`` stop.
     """
     messages = [
         {"role": "user", "content": "What is the secret password?"},
@@ -1032,10 +1070,333 @@ def test_weight_mask_only_covers_assistant_output(tokenizer, renderer):
     trained_tokens = [t for t, w in zip(tokens, weights) if w > 0]
     trained_text = tokenizer.decode(trained_tokens)
 
-    # Should start with '<think></think>' (no leading newline) and end with EOS.
-    assert trained_text.startswith("<think></think>"), trained_text
-    assert tokens[-1] == _eos(tokenizer), "last token must be <|endoftext|>"
+    # The opening '<think>' is part of the generation prefix, so it is masked.
+    assert trained_text.startswith("</think>"), trained_text
+    assert "<think>" not in trained_text
+    assert tokens[-1] == _user_token(tokenizer), "last token must be <|user|>"
+    assert trained_tokens[-1] == _user_token(tokenizer)
     assert "ALPHA-BRAVO" in trained_text
+
+
+def test_weight_mask_tool_call_stop_uses_observation(tokenizer, renderer):
+    """Tool-call assistant turns stop on <|observation|>, not <|user|>."""
+    messages = [
+        {"role": "user", "content": "weather?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [_make_tool_call("get_weather", {"city": "SF"})],
+        },
+    ]
+    tokens, weights = _renderer_supervised_tokens(renderer, messages)
+    trained_tokens = [t for t, w in zip(tokens, weights) if w > 0]
+
+    assert tokens[-1] == _observation_token(tokenizer)
+    assert trained_tokens[-1] == _observation_token(tokenizer)
+    assert _user_token(tokenizer) not in trained_tokens
+
+
+def test_weight_mask_terminal_tool_call_with_thinking_appends_observation_stop(
+    tokenizer, renderer_keep_thinking
+):
+    """Final assistant tool-call rows append/train <|observation|>."""
+    messages = [
+        {"role": "user", "content": "q1"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "answer first"},
+                {"type": "text", "text": "a1"},
+            ],
+        },
+        {"role": "user", "content": "lookup weather"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "need lookup"},
+                {"type": "text", "text": ""},
+            ],
+            "tool_calls": [_make_tool_call("lookup", {"q": "weather"})],
+        },
+    ]
+    tokens, weights = _renderer_supervised_tokens(renderer_keep_thinking, messages)
+    trained_tokens = [t for t, w in zip(tokens, weights) if w > 0]
+
+    assert tokens[-1] == _observation_token(tokenizer)
+    assert weights[-1] == 1
+    assert trained_tokens[-1] == _observation_token(tokenizer)
+
+    trained_text = tokenizer.decode(trained_tokens)
+    assert "<think>" not in trained_text
+    assert "need lookup</think>" in trained_text
+    assert "<tool_call>lookup" in trained_text
+
+
+def test_weight_mask_trains_role_stops_after_historical_assistants(
+    tokenizer, renderer
+):
+    """Only role tags that close assistant turns carry loss."""
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [_make_tool_call("lookup", {"q": "q2"})],
+        },
+        {"role": "tool", "content": "result"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    tokens, weights = _renderer_supervised_tokens(renderer, messages)
+    user = _user_token(tokenizer)
+    observation = _observation_token(tokenizer)
+    first_user = tokenizer.encode("<|user|>q1", add_special_tokens=False)
+    second_user = tokenizer.encode("<|user|>q2", add_special_tokens=False)
+    tool_call_close = _encode_single(tokenizer, "</tool_call>")
+
+    first_user_pos = _find_subsequence(tokens, first_user)
+    second_user_pos = _find_subsequence(tokens, second_user)
+    tool_call_end = tokens.index(tool_call_close)
+    observation_pos = tool_call_end + 1
+
+    assert tokens[first_user_pos] == user
+    assert weights[first_user_pos] == 0
+    assert all(
+        w == 0
+        for w in weights[first_user_pos + 1 : first_user_pos + len(first_user)]
+    )
+
+    assert tokens[second_user_pos] == user
+    assert weights[second_user_pos] == 1
+    assert all(
+        w == 0
+        for w in weights[
+            second_user_pos + 1 : second_user_pos + len(second_user)
+        ]
+    )
+
+    assert tokens[observation_pos] == observation
+    assert weights[observation_pos] == 1
+    assert tokens[-1] == user
+    assert weights[-1] == 1
+
+
+def test_weight_mask_multi_turn_tool_call_with_thinking_trains_observation_stop(
+    tokenizer, renderer_keep_thinking
+):
+    """Interleaved thinking/tool-call rows train the tool call and observation stop."""
+    messages = [
+        {"role": "system", "content": "Use tools when useful."},
+        {"role": "user", "content": "First question"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "answer directly"},
+                {"type": "text", "text": "first answer"},
+            ],
+        },
+        {"role": "user", "content": "Now lookup the weather"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "need weather tool"},
+                {"type": "text", "text": ""},
+            ],
+            "tool_calls": [_make_tool_call("get_weather", {"city": "SF"})],
+        },
+        {"role": "tool", "content": "sunny"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "tool says sunny"},
+                {"type": "text", "text": "It is sunny."},
+            ],
+        },
+    ]
+    tokens, weights = _renderer_supervised_tokens(renderer_keep_thinking, messages)
+
+    tool_call_open = _encode_single(tokenizer, "<tool_call>")
+    tool_call_close = _encode_single(tokenizer, "</tool_call>")
+    observation = _observation_token(tokenizer)
+    tool_response_open = _encode_single(tokenizer, "<tool_response>")
+    tool_response_close = _encode_single(tokenizer, "</tool_response>")
+
+    tool_call_start = tokens.index(tool_call_open)
+    tool_call_end = tokens.index(tool_call_close, tool_call_start)
+    observation_pos = tokens.index(observation, tool_call_end + 1)
+    tool_response_start = tokens.index(tool_response_open, observation_pos + 1)
+    tool_response_end = tokens.index(tool_response_close, tool_response_start)
+
+    assert observation_pos == tool_call_end + 1
+    assert all(w == 1 for w in weights[tool_call_start : tool_call_end + 1])
+    assert weights[observation_pos] == 1
+    assert all(
+        w == 0 for w in weights[tool_response_start : tool_response_end + 1]
+    )
+
+    trained_text = tokenizer.decode([t for t, w in zip(tokens, weights) if w > 0])
+    assert "<think>" not in trained_text
+    assert "need weather tool</think>" in trained_text
+    assert "<tool_call>get_weather" in trained_text
+    assert "<|observation|>" in trained_text
+    assert "<tool_response>sunny</tool_response>" not in trained_text
+
+
+def test_weight_mask_parallel_tool_responses_train_single_observation_stop(
+    tokenizer, renderer_keep_thinking
+):
+    """Parallel tool responses share one observation stop.
+
+    The model generates the assistant tool-call block and should learn to stop
+    by producing ``<|observation|>``. The following tool responses are
+    environment-provided context, so their ``<tool_response>...</tool_response>``
+    spans must stay masked even when multiple tool messages follow.
+    """
+    messages = [
+        {"role": "user", "content": "Plan with two tools"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "need two tools"},
+                {"type": "text", "text": ""},
+            ],
+            "tool_calls": [
+                _make_tool_call("get_weather", {"city": "SF"}),
+                _make_tool_call("convert_units", {"value": 72, "from": "F"}),
+            ],
+        },
+        {"role": "tool", "content": "WEATHER_RESULT_ABC"},
+        {"role": "tool", "content": "CONVERT_RESULT_XYZ"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "combine tool results"},
+                {"type": "text", "text": "done"},
+            ],
+        },
+    ]
+    tokens, weights = _renderer_supervised_tokens(renderer_keep_thinking, messages)
+    observation = _observation_token(tokenizer)
+    user = _user_token(tokenizer)
+    tool_call_close = _encode_single(tokenizer, "</tool_call>")
+    first_response_text = "<tool_response>WEATHER_RESULT_ABC</tool_response>"
+    second_response_text = "<tool_response>CONVERT_RESULT_XYZ</tool_response>"
+
+    observation_positions = [
+        i for i, token in enumerate(tokens) if token == observation
+    ]
+    tool_call_close_positions = [
+        i for i, token in enumerate(tokens) if token == tool_call_close
+    ]
+
+    # The two parallel tool calls are both model output. The single
+    # observation tag that follows the last tool call is the model's stop token.
+    assert len(tool_call_close_positions) == 2
+    assert len(observation_positions) == 1
+    observation_pos = observation_positions[0]
+    assert observation_pos == tool_call_close_positions[-1] + 1
+    assert weights[observation_pos] == 1
+
+    def assert_tool_response_span_is_masked(response_text: str) -> None:
+        response_tokens = tokenizer.encode(response_text, add_special_tokens=False)
+        response_start = _find_subsequence(tokens, response_tokens)
+        response_weights = weights[
+            response_start : response_start + len(response_tokens)
+        ]
+
+        assert response_weights == [0.0] * len(response_tokens), (
+            f"Tool response {response_text!r} is environment output and should "
+            f"be masked, got weights {response_weights}"
+        )
+
+    assert_tool_response_span_is_masked(first_response_text)
+    assert_tool_response_span_is_masked(second_response_text)
+
+    # The final assistant answer is a normal assistant turn, so its synthetic
+    # terminal stop is <|user|>, separate from the earlier tool-call stop.
+    assert tokens[-1] == user
+    assert weights[-1] == 1
+
+    trained_text = tokenizer.decode([t for t, w in zip(tokens, weights) if w > 0])
+    assert "<tool_call>get_weather" in trained_text
+    assert "<tool_call>convert_units" in trained_text
+    assert "<|observation|>" in trained_text
+    assert "WEATHER_RESULT_ABC" not in trained_text
+    assert "CONVERT_RESULT_XYZ" not in trained_text
+
+
+def test_weight_mask_parallel_tool_response_audit_table(
+    tokenizer, renderer_keep_thinking
+):
+    """Explicit token/mask table for GLM parallel tool-response rendering."""
+    messages = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "t"},
+                {"type": "text", "text": ""},
+            ],
+            "tool_calls": [_make_tool_call("f", {"x": 1})],
+        },
+        {"role": "tool", "content": "r1"},
+        {"role": "tool", "content": "r2"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "u"},
+                {"type": "text", "text": "a"},
+            ],
+        },
+    ]
+    tokens, weights = _renderer_supervised_tokens(renderer_keep_thinking, messages)
+
+    # Each row is (position, token id, decoded token text, loss weight).
+    # This makes the important boundaries visible:
+    # - position 5 is the injected <think> prefix and stays masked
+    # - positions 6-17 are model-generated thinking/tool-call/observation stop
+    # - positions 18-25 are tool responses supplied by the environment
+    # - positions 27-31 are the final assistant turn plus its <|user|> stop
+    rows = [
+        (idx, token_id, tokenizer.decode([token_id]), int(weight))
+        for idx, (token_id, weight) in enumerate(zip(tokens, weights))
+    ]
+
+    assert rows == [
+        (0, 154822, "[gMASK]", 0),
+        (1, 154824, "<sop>", 0),
+        (2, 154827, "<|user|>", 0),
+        (3, 80, "q", 0),
+        (4, 154828, "<|assistant|>", 0),
+        (5, 154841, "<think>", 0),
+        (6, 83, "t", 1),
+        (7, 154842, "</think>", 1),
+        (8, 154843, "<tool_call>", 1),
+        (9, 69, "f", 1),
+        (10, 154847, "<arg_key>", 1),
+        (11, 87, "x", 1),
+        (12, 154848, "</arg_key>", 1),
+        (13, 154849, "<arg_value>", 1),
+        (14, 16, "1", 1),
+        (15, 154850, "</arg_value>", 1),
+        (16, 154844, "</tool_call>", 1),
+        (17, 154829, "<|observation|>", 1),
+        (18, 154845, "<tool_response>", 0),
+        (19, 81, "r", 0),
+        (20, 16, "1", 0),
+        (21, 154846, "</tool_response>", 0),
+        (22, 154845, "<tool_response>", 0),
+        (23, 81, "r", 0),
+        (24, 17, "2", 0),
+        (25, 154846, "</tool_response>", 0),
+        (26, 154828, "<|assistant|>", 0),
+        (27, 154841, "<think>", 0),
+        (28, 84, "u", 1),
+        (29, 154842, "</think>", 1),
+        (30, 64, "a", 1),
+        (31, 154827, "<|user|>", 1),
+    ]
 
 
 def test_weight_mask_multi_turn_covers_all_assistant_turns(tokenizer, renderer):
@@ -1066,7 +1427,8 @@ def test_weight_mask_with_thinking(tokenizer, renderer):
     trained_tokens = [t for t, w in zip(tokens, weights) if w > 0]
     trained_text = tokenizer.decode(trained_tokens)
 
-    assert "<think>my reasoning</think>" in trained_text
+    assert "<think>" not in trained_text
+    assert "my reasoning</think>" in trained_text
     assert "answer" in trained_text
     assert "q" not in trained_text
 
@@ -1100,15 +1462,14 @@ def test_bos_tokens_are_gMASK_sop(tokenizer, renderer):
     assert len(bos) == 2  # [gMASK]=154822, <sop>=154824 on GLM-5.1
 
 
-def test_stop_sequences_returns_eos_and_next_role_tags(tokenizer, renderer):
+def test_stop_sequences_returns_next_role_tags_not_eos(tokenizer, renderer):
     stops = renderer.get_stop_sequences()
     expected = [
-        GLM5_SERVERLESS_STOP_TOKEN_IDS["eos"],
         GLM5_SERVERLESS_STOP_TOKEN_IDS["user"],
         GLM5_SERVERLESS_STOP_TOKEN_IDS["observation"],
     ]
     assert stops == expected
-    assert _eos(tokenizer) == GLM5_SERVERLESS_STOP_TOKEN_IDS["eos"]
+    assert _eos(tokenizer) not in stops
     assert all(
         len(tokenizer.encode(tag, add_special_tokens=False)) == 1
         for tag in ("<|user|>", "<|observation|>")
@@ -1142,10 +1503,12 @@ def test_generation_suffix_is_role_tag(tokenizer, renderer):
 
 
 def test_parse_response_roundtrip(tokenizer, renderer):
-    """parse_response on <think>R</think>\\n{content}<|endoftext|> must extract content."""
-    # Simulate what the model would emit post <|assistant|>: "\n<think>reason</think>\nhello<|endoftext|>"
+    """parse_response on <think>R</think>{content}<|user|> must extract content."""
+    # Simulate what the model would emit after the <|assistant|><think> prompt.
     simulated = "\n<think>reason</think>\nhello"
-    ids = tokenizer.encode(simulated, add_special_tokens=False) + [_eos(tokenizer)]
+    ids = tokenizer.encode(simulated, add_special_tokens=False) + [
+        _user_token(tokenizer)
+    ]
     message, ok = renderer.parse_response(ids)
     assert ok is True
     # Content may be structured (think_blocks parsed) or a string — both should contain 'hello'.
@@ -1203,7 +1566,9 @@ def test_parse_response_no_stop_token(tokenizer, renderer):
 def test_parse_response_empty_thinking(tokenizer, renderer):
     """parse_response with empty think block extracts content correctly."""
     simulated = "<think></think>just the answer"
-    ids = tokenizer.encode(simulated, add_special_tokens=False) + [_eos(tokenizer)]
+    ids = tokenizer.encode(simulated, add_special_tokens=False) + [
+        _user_token(tokenizer)
+    ]
     message, ok = renderer.parse_response(ids)
     assert ok is True
     content = message["content"]
@@ -1417,10 +1782,10 @@ def test_recorded_fireworks_prompt_cases_cover_glm_role_and_tool_tokens(tokenize
     ],
 )
 def test_supervised_parity(tokenizer, renderer, messages):
-    """Parametrized: supervised tokens match HF byte-for-byte (modulo EOS)."""
+    """Supervised tokens match HF modulo terminal role-stop overlap."""
     hf = _hf_tokens(tokenizer, messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(ours, hf, tokenizer, messages)
 
 
 # ── Tool call parity ────────────────────────────────────────────────────────
@@ -1496,7 +1861,7 @@ def _hf_tool_calls(specs: list[tuple[str, dict[str, Any]]]) -> list[dict[str, An
     ],
 )
 def test_tool_call_supervised_parity(tokenizer, renderer, build_messages):
-    """Tool-call assistant turns match HF byte-for-byte (modulo EOS).
+    """Tool-call assistant turns match HF modulo terminal role-stop overlap.
 
     HF's chat template iterates ``arguments.items()`` so it needs dict-form
     args; our renderer reads the Tinker ``ToolCall`` schema (JSON-string args).
@@ -1509,7 +1874,9 @@ def test_tool_call_supervised_parity(tokenizer, renderer, build_messages):
     hf_messages = build_messages(_hf_tool_calls)
     hf = _hf_tokens(tokenizer, hf_messages, add_generation_prompt=False)
     ours, _ = _renderer_supervised_tokens(renderer, renderer_messages)
-    _assert_parity_modulo_trailing_eos(ours, hf, tokenizer, expect_eos=True)
+    _assert_supervised_parity_with_role_stop(
+        ours, hf, tokenizer, renderer_messages
+    )
 
 
 def test_tool_call_tokens_are_trained(tokenizer, renderer):
