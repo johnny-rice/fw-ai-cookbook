@@ -56,6 +56,7 @@ from training.utils import (
     DeployConfig,
     InfraConfig,
     JsonlRenderDataset,
+    RawRowCursor,
     ReconnectableClient,
     ResourceCleanup,
     RunStatus,
@@ -291,6 +292,7 @@ async def _train_loop(
     cfg: Config,
     step_offset: int,
     *,
+    cursor: RawRowCursor,
     ckpt: TrainingCheckpoints | None = None,
     worker_init_fn: Callable[[int], None] | None = None,
     on_ref_done: Callable[[], None] | None = None,
@@ -361,7 +363,7 @@ async def _train_loop(
                     f"step-{step}",
                     resumable=True,
                     promotable=False,
-                    data_consumed=(step - step_offset) * cfg.batch_size,
+                    data_consumed=cursor.value,
                 )
 
         step_elapsed = time.monotonic() - step_t0
@@ -434,7 +436,9 @@ async def _train_loop(
             if batch is sentinel:
                 break
             batches_consumed += 1
-            raw_rows_consumed = min(batches_consumed * batch_size, total_raw_rows)
+            delta = min(batch_size, total_raw_rows - raw_rows_consumed)
+            raw_rows_consumed += delta
+            cursor.record(delta)
             if (
                 total_raw_rows > 0
                 and (
@@ -516,6 +520,8 @@ async def _train_loop(
             if chunk:
                 _run_train_step(epoch, chunk)
                 pbar.update(1)
+            # Replay re-consumes source rows; cache holds only post-filter pairs.
+            cursor.record(total_raw_rows)
 
     pbar.close()
     return step
@@ -698,11 +704,14 @@ def main(
             except Exception as e:
                 logger.warning("Early cleanup of reference job %s failed: %s", reference_job_id, e)
 
+        cursor = RawRowCursor(max_rows=len(pair_dataset) * cfg.epochs)
+        cursor.resume(resume_info.data_consumed if resume_info else None)
         runner.start_training()
         step = asyncio.run(
             _train_loop(
                 pair_dataset, ref_cache_log,
                 reference, policy, adam_params, cfg, step_offset,
+                cursor=cursor,
                 ckpt=ckpt,
                 worker_init_fn=worker_init_fn,
                 on_ref_done=_on_ref_done,
@@ -719,7 +728,7 @@ def main(
                 cp_name,
                 resumable=True,
                 promotable=True,
-                data_consumed=(step - step_offset) * cfg.batch_size,
+                data_consumed=cursor.value,
             )
 
             if getattr(cfg, "output_model_id", None):
