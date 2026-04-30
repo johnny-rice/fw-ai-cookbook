@@ -2,6 +2,10 @@
 
 Four standalone scripts live in `training/examples/tools/`. Each does one operation; none needs an active trainer.
 
+For renderer work, see the dedicated skills under `cookbook/skills/`:
+- [`renderer/SKILL.md`](../../renderer/SKILL.md) — implementing a new renderer.
+- [`verifier/SKILL.md`](../../verifier/SKILL.md) — validating a renderer against the live gateway and the upstream HF chat template.
+
 ## `promote_checkpoint.py`
 
 Promote a sampler checkpoint to a deployable Fireworks model. Queries the control plane directly via `list_checkpoints(job_id)` — no `checkpoints.jsonl` needed (and none is written; that legacy registry was removed when the cookbook moved to the CP-as-source-of-truth model).
