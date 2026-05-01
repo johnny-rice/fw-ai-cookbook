@@ -311,7 +311,7 @@ def test_main_bootstraps_without_reference_and_cleans_up(monkeypatch, tmp_path):
     monkeypatch.setattr(train_module, "ReconnectableClient", FakeClient)
     monkeypatch.setattr(train_module, "WeightSyncer", FakeWeightSyncer)
     monkeypatch.setattr(train_module, "FrozenLakeToolRolloutProcessor", FakeRolloutProcessor)
-    monkeypatch.setattr(train_module, "build_loss_fn", lambda **kwargs: ("loss-builder", kwargs))
+    monkeypatch.setattr(train_module, "build_loss_fn", lambda args: ("loss-builder", args))
     monkeypatch.setattr(train_module, "run_rl_loop", fake_run_rl_loop)
     monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: SimpleNamespace(status_code=200))
 
@@ -576,8 +576,8 @@ def test_main_runs_sampling_and_training_with_reference(monkeypatch, tmp_path):
         events["deployment_shape"] = deploy_cfg.deployment_shape
         return SimpleNamespace(inference_model="accounts/test/models/deployed")
 
-    def fake_build_loss_fn(**kwargs):
-        events["build_loss_fn_kwargs"] = kwargs
+    def fake_build_loss_fn(args):
+        events["build_loss_fn_args"] = args
         def _builder(adv, ref_lp, prompt_lens, inf_lp, prox_lp):
             events["build_loss_fn_calls"].append(
                 {
@@ -653,10 +653,12 @@ def test_main_runs_sampling_and_training_with_reference(monkeypatch, tmp_path):
         ("policy-job", "step-1-session", "promoted-rl-model"),
     ]
     assert "fwd_bwd_call" in events
-    assert events["build_loss_fn_kwargs"]["ratio_log_cap"] == 9.0
-    # kl_beta > 0 forces the client-side custom path (server builtin kernels
-    # do not consume ref_logprobs and would silently drop the KL penalty --
-    # see resolve_builtin_loss gate in training/utils/rl/losses.py).
+    assert events["build_loss_fn_args"].ratio_log_cap == 9.0
+    # FrozenLakeConfig defaults to loss_path='client' (always-safe path).
+    # Builtin kernels do not consume ref_logprobs and would silently drop
+    # the KL penalty -- validate_loss_path guards against that explicitly,
+    # but the default already matches what kl_beta>0 needs.
+    assert cfg.loss_path == "client"
     assert cfg.kl_beta > 0
     assert events["fwd_bwd_call"]["loss_fn"] == "loss-fn"
     assert "loss_fn_config" not in events["fwd_bwd_call"]

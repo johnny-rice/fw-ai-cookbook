@@ -14,14 +14,14 @@ from training.utils.losses import (
 )
 from training.utils.rl.common import _normalize_prompt_lens
 from training.utils.rl.gspo import GSPOConfig
+from training.utils.rl.client_losses import CLIENT_LOSSES
 from training.utils.rl.losses import (
-    LOSS_REGISTRY,
+    LossConfig,
     build_builtin_loss_datums,
     build_loss_fn,
     get_builtin_loss_config,
-    resolve_builtin_loss,
+    validate_loss_path,
 )
-from training.utils.rl.spec import LossSpec
 from training.utils.supervised import build_datum_from_token_mask
 
 
@@ -48,12 +48,14 @@ class TestNormalizePromptLens:
 
 class TestLossBuilder:
     def test_rejects_unknown_policy_loss(self):
-        builder = build_loss_fn(policy_loss="unknown", kl_beta=0.01)
+        # ``LossConfig`` is typed against the ``PolicyLoss`` Literal; cast to
+        # build a deliberately-invalid bundle for the negative-path test.
+        builder = build_loss_fn(LossConfig(policy_loss="unknown", kl_beta=0.01))  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="Unsupported policy_loss"):
             builder([1.0], [_zeros(4)], [2], [_zeros(4)], [_zeros(4)])
 
     def test_grpo_requires_inference_logprobs(self):
-        builder = build_loss_fn(policy_loss="grpo", kl_beta=0.01)
+        builder = build_loss_fn(LossConfig(policy_loss="grpo", kl_beta=0.01))
         loss_fn = builder([1.0], [_zeros(4)], [2], [[]], [_zeros(4)])
 
         with pytest.raises(ValueError, match="GRPO requires inference logprobs"):
@@ -62,34 +64,36 @@ class TestLossBuilder:
     def test_client_only_loss_registration_uses_custom_path(self, monkeypatch):
         events: dict[str, object] = {}
 
-        def fake_client_loss_factory(**kwargs):
-            events["kwargs"] = kwargs
+        def fake_factory(args, advantages, ref_logprobs, prompt_lens, inf_logprobs, prox_logprobs):
+            events["call"] = {
+                "advantages": advantages,
+                "prompt_lens": prompt_lens,
+                "kl_beta": args.kl_beta,
+            }
             return "client-only-loss"
 
-        monkeypatch.setitem(
-            LOSS_REGISTRY,
-            "client_only_test",
-            LossSpec(
-                name="client_only_test",
-                client_loss_factory=fake_client_loss_factory,
-            ),
-        )
+        monkeypatch.setitem(CLIENT_LOSSES, "client_only_test", fake_factory)
 
-        assert resolve_builtin_loss("client_only_test") is None
+        # A client-only loss must reject loss_path='builtin' loudly.
+        with pytest.raises(ValueError, match="client-side-only"):
+            validate_loss_path(
+                LossConfig(policy_loss="client_only_test", loss_path="builtin")  # type: ignore[arg-type]
+            )
 
-        builder = build_loss_fn(policy_loss="client_only_test", kl_beta=0.01)
+        builder = build_loss_fn(LossConfig(policy_loss="client_only_test", kl_beta=0.01))  # type: ignore[arg-type]
         loss_fn = builder([1.0], [_zeros(4)], [2], [_zeros(4)], [_zeros(4)])
 
         assert loss_fn == "client-only-loss"
-        assert events["kwargs"]["advantages"] == [1.0]
-        assert events["kwargs"]["prompt_lens"] == [2]
-        assert events["kwargs"]["kl_beta"] == pytest.approx(0.01)
+        assert events["call"]["advantages"] == [1.0]
+        assert events["call"]["prompt_lens"] == [2]
+        assert events["call"]["kl_beta"] == pytest.approx(0.01)
 
 
 class TestBuiltinLossConfig:
     def test_grpo_preserves_zero_upper_clip_bound(self):
         kernel, config = get_builtin_loss_config(
-            "grpo", eps_clip=0.2, eps_clip_high=0.0,
+            LossConfig(policy_loss="grpo", loss_path="builtin",
+                       eps_clip=0.2, eps_clip_high=0.0),
         )
 
         assert kernel == "ppo"
@@ -98,10 +102,9 @@ class TestBuiltinLossConfig:
 
     def test_gspo_preserves_zero_clip_bounds(self):
         kernel, config = get_builtin_loss_config(
-            "gspo",
-            gspo_config=GSPOConfig(
-                clip_ratio_low=0.0,
-                clip_ratio_high=0.0,
+            LossConfig(
+                policy_loss="gspo", loss_path="builtin",
+                gspo=GSPOConfig(clip_ratio_low=0.0, clip_ratio_high=0.0),
             ),
         )
 
@@ -111,12 +114,18 @@ class TestBuiltinLossConfig:
 
     def test_importance_sampling_uses_ratio_log_cap(self):
         kernel, config = get_builtin_loss_config(
-            "importance_sampling",
-            ratio_log_cap=7.5,
+            LossConfig(policy_loss="importance_sampling", loss_path="builtin",
+                       ratio_log_cap=7.5),
         )
 
         assert kernel == "importance_sampling"
         assert config["ratio_log_cap"] == pytest.approx(7.5)
+
+    def test_get_builtin_loss_config_rejects_client_path(self):
+        with pytest.raises(ValueError, match="loss_path='client'"):
+            get_builtin_loss_config(
+                LossConfig(policy_loss="grpo", loss_path="client"),
+            )
 
     def test_builtin_datums_require_inference_logprobs(self):
         datum = build_datum_from_token_mask(
@@ -136,18 +145,19 @@ class TestBuiltinLossConfig:
 
 
 class TestKLBetaRoutesToClientSide:
-    """Documents the silent-KL-drop bug and the fix contract.
+    """Documents the silent-KL-drop footgun and the explicit-path contract.
 
     Bug: the server-side builtin kernels receive datums produced by
     :func:`training.utils.rl.losses.build_builtin_loss_datums`, whose
     ``loss_fn_inputs`` are exactly ``{target_tokens, logprobs, advantages}``
-    -- no ``ref_logprobs`` field is ever sent to the trainer. So when a caller
-    sets ``kl_beta > 0`` expecting a KL penalty, the builtin PPO kernel
-    silently drops the ``kl_beta * (pi - pi_ref)`` term.
+    -- no ``ref_logprobs`` field is ever sent to the trainer. So when a
+    caller sets ``kl_beta > 0`` expecting a KL penalty, the builtin PPO
+    kernel silently drops the ``kl_beta * (pi - pi_ref)`` term.
 
-    Fix: ``resolve_builtin_loss`` must gate on ``kl_beta`` and return ``None``
-    when positive, forcing the recipe onto ``forward_backward_custom(...)``,
-    which is the only path that actually applies the KL penalty.
+    Fix: ``loss_path`` is now an **explicit** user choice. Picking
+    ``"builtin"`` with ``kl_beta > 0`` raises in :func:`validate_loss_path`
+    instead of silently rerouting -- the user has to pick ``loss_path='client'``
+    or ``kl_beta=0`` themselves.
     """
 
     @staticmethod
@@ -170,10 +180,10 @@ class TestKLBetaRoutesToClientSide:
     def test_builtin_datum_has_no_ref_logprobs_field(self):
         """Structural invariant: the server-side path carries no ref logprobs.
 
-        This is the root cause of the silent KL drop. Encoded as a test so the
-        motivation for the ``kl_beta`` gate remains explicit: if this invariant
-        ever changes (e.g. the server kernel learns to consume ref logprobs),
-        the gate below can be relaxed.
+        This is the root cause of the silent KL drop. Encoded as a test so
+        the motivation for the ``validate_loss_path`` kl_beta guard remains
+        explicit: if this invariant ever changes (e.g. the server kernel
+        learns to consume ref logprobs), the guard can be relaxed.
         """
         fields = set(self._builtin_datum().loss_fn_inputs.keys())
 
@@ -187,38 +197,26 @@ class TestKLBetaRoutesToClientSide:
             "kernel now consumes it, the kl_beta gate can be lifted."
         )
 
-    def test_resolve_builtin_loss_gates_on_kl_beta_for_grpo(self):
-        """With ``kl_beta > 0`` the dispatch must return ``None`` (client-side)."""
-        try:
-            result = resolve_builtin_loss("grpo", profile=None, kl_beta=0.01)
-        except TypeError as exc:
-            pytest.fail(
-                "resolve_builtin_loss currently ignores kl_beta "
-                f"({exc}). The server-side builtin datum has no "
-                "ref_logprobs field (see "
-                "test_builtin_datum_has_no_ref_logprobs_field), so "
-                "kl_beta > 0 routed to the builtin kernel is silently "
-                "dropped. Add a `kl_beta: float = 0.0` parameter to "
-                "resolve_builtin_loss and return None when it is positive."
+    def test_validate_loss_path_rejects_builtin_with_kl_beta(self):
+        """``loss_path='builtin'`` + ``kl_beta>0`` must raise (no silent drop)."""
+        with pytest.raises(ValueError, match=r"kl_beta=.* > 0"):
+            validate_loss_path(
+                LossConfig(policy_loss="grpo", loss_path="builtin", kl_beta=0.01),
             )
 
-        assert result is None, (
-            "kl_beta>0 requested a KL penalty, but resolve_builtin_loss "
-            f"returned the server-side builtin kernel {result!r}. That "
-            "kernel silently drops the KL term (no ref_logprobs in the "
-            "datum). Must return None to force forward_backward_custom."
+    def test_validate_loss_path_accepts_builtin_with_kl_beta_zero(self):
+        """Regression guard: ``kl_beta == 0`` must still allow the fast path."""
+        # No raise.
+        validate_loss_path(
+            LossConfig(policy_loss="grpo", loss_path="builtin", kl_beta=0.0),
         )
 
-    def test_resolve_builtin_loss_kl_beta_zero_keeps_server_builtin(self):
-        """Regression guard: ``kl_beta == 0`` must still take the fast path."""
-        result = resolve_builtin_loss("grpo", profile=None)
-
-        assert result is not None, (
-            "GRPO with kl_beta=0 must keep the fast server-side PPO path. "
-            "The kl_beta gate must not over-broadly block the builtin path."
+    def test_validate_loss_path_accepts_client_with_kl_beta(self):
+        """Client path tolerates any kl_beta -- it consumes ref_logprobs."""
+        # No raise.
+        validate_loss_path(
+            LossConfig(policy_loss="grpo", loss_path="client", kl_beta=0.01),
         )
-        kernel, _config = result
-        assert kernel == "ppo"
 
 
 class TestBatchDPOLoss:
