@@ -62,7 +62,8 @@ class InfraConfig:
 
     * **Shape path** (``training_shape_id`` set): the backend owns all
       shape-derived fields (accelerator, image tag, node count).
-      Setting infra overrides raises ``ValueError``.
+      Setting shape-owned infra overrides raises ``ValueError``; run-level
+      controls such as ``trainer_replica_count`` remain valid.
     * **Manual path** (``training_shape_id`` is ``None``): all fields
       are sent as-is; the server skips shape validation.
     """
@@ -87,12 +88,32 @@ class InfraConfig:
     node_count: int | None = None
     trainer_timeout_s: float = 3600
     extra_args: list[str] | None = None
+    trainer_replica_count: int | None = None
+    """Data-parallel trainer replica count for service-mode HSDP launches.
+
+    Leave unset for the backend default. Values greater than 1 request
+    replicated HSDP for this trainer launch; this is intentionally a run-level
+    knob, not part of the validated training shape.
+    """
     purpose: str | None = None
     """Optional ``Purpose`` proto enum name (e.g. ``"PURPOSE_PILOT"``)."""
     managed_by: str | None = None
     """Internal. Populated automatically by the Fireworks platform when needed."""
     skip_validations: bool = False
     """Skip server-side shape validation. Requires superuser API key."""
+
+
+def apply_trainer_replica_count(
+    infra: InfraConfig,
+    trainer_replica_count: int | None,
+) -> None:
+    """Apply a non-default recipe-level trainer replica count unless infra set one."""
+    if trainer_replica_count is not None and trainer_replica_count < 0:
+        raise ValueError("trainer_replica_count must be non-negative")
+    if trainer_replica_count is None or trainer_replica_count <= 1:
+        return
+    if infra.trainer_replica_count is None:
+        infra.trainer_replica_count = trainer_replica_count
 
 
 class WeightSyncScope(Enum):
@@ -202,4 +223,3 @@ class WandBConfig:
     entity: str | None = None
     project: str | None = None
     run_name: str | None = None
-
