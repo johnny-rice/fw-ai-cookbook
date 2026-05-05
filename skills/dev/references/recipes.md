@@ -7,7 +7,7 @@ Each recipe is a single Python file in `training/recipes/` that wires the Traini
 | SFT | `training/recipes/sft_loop.py` |
 | DPO | `training/recipes/dpo_loop.py` |
 | ORPO | `training/recipes/orpo_loop.py` |
-| Importance-weighted GRPO | `training/recipes/igpo_loop.py` |
+| Information Gain-based Policy Optimization (IGPO) | `training/recipes/igpo_loop.py` |
 | Generic RL loop (GRPO scaffold) | `training/recipes/rl_loop.py` |
 | Async RL loop (rollout/train overlap, PPO inner minibatches) | `training/recipes/async_rl_loop.py` — see [`rl/async-rl.md`](rl/async-rl.md) |
 
@@ -23,7 +23,7 @@ Always required on `Config` + `InfraConfig`:
 - `dataset` — path to JSONL
 - `tokenizer_model` — HF model name
 - `log_path` — directory for `dataloader.json` and logs
-- `infra.training_shape_id` — **required**; do not set manual `accelerator_type` / `node_count` (see [`shapes.md`](shapes.md))
+- `infra.training_shape_id` — optional override; leave unset for auto-selection. Do not set manual `accelerator_type` / `node_count` (see [`shapes.md`](shapes.md))
 
 RL-specific (in `rl_loop.py`'s `Config`): reward function, rollout batch sizes, deployment config (shape is auto-filled from the profile).
 
